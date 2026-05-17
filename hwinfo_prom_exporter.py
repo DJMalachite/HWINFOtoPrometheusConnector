@@ -22,6 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+import paho.mqtt.client as mqtt
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from prometheus_client.core import GaugeMetricFamily, REGISTRY
 
@@ -37,11 +38,30 @@ POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "0.3"))
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "2"))
 DOWN_RETRY_INTERVAL = float(os.getenv("DOWN_RETRY_INTERVAL", "2"))
 REQUEST_RETRIES = int(os.getenv("REQUEST_RETRIES", "1"))
+SOURCE_MODE = os.getenv("SOURCE_MODE", "http").strip().lower()
 
 # Freshness timeout is intentionally independent of poll interval.
 # If no successful poll arrives within this window, sensor data is treated as stale
 # and omitted from /metrics so Prometheus does not scrape old values as current.
 DATA_FRESHNESS_TIMEOUT = float(os.getenv("DATA_FRESHNESS_TIMEOUT", "20"))
+STALE_VALUE_MODE = os.getenv("STALE_VALUE_MODE", "hide").strip().lower()
+if STALE_VALUE_MODE not in {"hide", "keep", "nan"}:
+    STALE_VALUE_MODE = "hide"
+
+MQTT_HOST = os.getenv("MQTT_HOST", "127.0.0.1")
+MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
+MQTT_TOPIC = os.getenv("MQTT_TOPIC", "aquasuite/#")
+MQTT_USERNAME = os.getenv("MQTT_USERNAME")
+MQTT_PASSWORD = os.getenv("MQTT_PASSWORD")
+MQTT_CLIENT_ID = os.getenv("MQTT_CLIENT_ID", f"hardware-exporter-{socket.gethostname()}-{os.getpid()}")
+MQTT_KEEPALIVE = int(os.getenv("MQTT_KEEPALIVE", "60"))
+MQTT_QOS = int(os.getenv("MQTT_QOS", "0"))
+MQTT_TLS = os.getenv("MQTT_TLS", "false").strip().lower() in ("1", "true", "yes", "on")
+MQTT_RECONNECT_MIN_DELAY = int(os.getenv("MQTT_RECONNECT_MIN_DELAY", "1"))
+MQTT_RECONNECT_MAX_DELAY = int(os.getenv("MQTT_RECONNECT_MAX_DELAY", "30"))
+MQTT_STALE_AFTER_SECONDS = float(os.getenv("MQTT_STALE_AFTER_SECONDS", "10"))
+MQTT_DEFAULT_SENSOR_APP = os.getenv("MQTT_DEFAULT_SENSOR_APP", "aquasuite")
+MQTT_DEFAULT_SENSOR_CLASS = os.getenv("MQTT_DEFAULT_SENSOR_CLASS", "aquasuite")
 
 EXPORTER_HOST = os.getenv("EXPORTER_HOST", socket.gethostname())
 METRIC_PREFIX = os.getenv("METRIC_PREFIX", "hwinfo")
@@ -225,6 +245,13 @@ class ExporterState:
         self.failed_polls: int = 0
         self.raw_items_last: int = 0
         self.exported_items_last: int = 0
+        self.source_mode: str = SOURCE_MODE
+        self.mqtt_connected: int = 0
+        self.mqtt_last_message_ts: float = 0.0
+        self.mqtt_messages_total: int = 0
+        self.mqtt_parse_errors_total: int = 0
+        self.mqtt_reconnects_total: int = 0
+        self.mqtt_seen_connect: bool = False
 
 
 state = ExporterState()
@@ -309,6 +336,68 @@ def parse_hwinfo_payload(payload: Any) -> Tuple[List[Dict[str, Any]], int]:
     return final_rows, raw_count
 
 
+def parse_mqtt_payload(payload: Any, mqtt_topic: str, received_ts: float) -> Tuple[List[Dict[str, Any]], int]:
+    payload_dict = payload if isinstance(payload, dict) else {}
+    if isinstance(payload, dict) and isinstance(payload.get("Data"), list):
+        items = payload["Data"]
+    elif isinstance(payload, list):
+        items = payload
+    else:
+        raise ValueError("MQTT payload did not contain a supported sensor list")
+
+    raw_count = len(items)
+    parsed_rows: List[Dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        sensor_app = safe_label(item.get("SensorApp") or payload_dict.get("SensorApp") or MQTT_DEFAULT_SENSOR_APP)
+        sensor_class = safe_label(
+            item.get("SensorClass")
+            or payload_dict.get("Title")
+            or payload_dict.get("Topic")
+            or mqtt_topic
+            or MQTT_DEFAULT_SENSOR_CLASS
+        )
+        sensor_name = safe_label(item.get("SensorName") or item.get("Name"))
+        sensor_unit_raw = normalize_unit_raw(item.get("SensorUnit") if "SensorUnit" in item else item.get("Unit", ""))
+        sensor_unit = normalize_unit(item.get("SensorUnit") if "SensorUnit" in item else item.get("Unit", ""))
+        sensor_update_time = safe_float(item.get("SensorUpdateTime"))
+        sensor_value = safe_float(item.get("SensorValue") if "SensorValue" in item else item.get("Value"))
+
+        if not sensor_name or sensor_value is None:
+            continue
+        if not should_include(sensor_name, sensor_class, sensor_app):
+            continue
+
+        parsed_rows.append(
+            {
+                "sensor_app": sensor_app,
+                "sensor_class": sensor_class,
+                "sensor_name": sensor_name,
+                "sensor_unit": sensor_unit,
+                "sensor_unit_raw": sensor_unit_raw,
+                "sensor_update_time": sensor_update_time if sensor_update_time is not None else received_ts,
+                "sensor_value": sensor_value,
+                "sensor_id": safe_label(item.get("Id", "")),
+                "mqtt_topic": safe_label(mqtt_topic),
+                "payload_topic": safe_label(payload_dict.get("Topic", "")),
+                "source": "mqtt",
+            }
+        )
+
+    key_counts = Counter((row["sensor_app"], row["sensor_class"], row["sensor_name"], row["sensor_unit"], row["sensor_unit_raw"]) for row in parsed_rows)
+    occurrence_seen: Counter = Counter()
+    final_rows: List[Dict[str, Any]] = []
+    for row in parsed_rows:
+        base_key = (row["sensor_app"], row["sensor_class"], row["sensor_name"], row["sensor_unit"], row["sensor_unit_raw"])
+        occurrence_seen[base_key] += 1
+        out = dict(row)
+        out["occurrence"] = str(occurrence_seen[base_key]) if key_counts[base_key] > 1 else "1"
+        final_rows.append(out)
+    return final_rows, raw_count
+
+
 # -----------------------------------------------------------------------------
 # Polling / reconnect
 # -----------------------------------------------------------------------------
@@ -330,7 +419,61 @@ session = build_session()
 
 
 def _expired(now: float, last_success_ts: float) -> bool:
-    return (last_success_ts <= 0) or ((now - last_success_ts) > DATA_FRESHNESS_TIMEOUT)
+    timeout = MQTT_STALE_AFTER_SECONDS if SOURCE_MODE == "mqtt" else DATA_FRESHNESS_TIMEOUT
+    return (last_success_ts <= 0) or ((now - last_success_ts) > timeout)
+
+
+mqtt_client: Optional[mqtt.Client] = None
+
+
+def on_mqtt_connect(client, userdata, flags, reason_code, properties=None):
+    del client, userdata, flags, properties
+    with state.lock:
+        reconnecting = state.mqtt_seen_connect
+        state.mqtt_connected = 1
+        state.source_up = 1
+        if reconnecting:
+            state.mqtt_reconnects_total += 1
+        state.mqtt_seen_connect = True
+    logger.info("MQTT connected (reason_code=%s); subscribing topic=%s qos=%s", reason_code, MQTT_TOPIC, MQTT_QOS)
+    mqtt_client.subscribe(MQTT_TOPIC, qos=MQTT_QOS)
+
+
+def on_mqtt_disconnect(client, userdata, reason_code, properties=None):
+    del client, userdata, properties
+    with state.lock:
+        state.mqtt_connected = 0
+        state.source_up = 0
+    logger.warning("MQTT disconnected (reason_code=%s)", reason_code)
+
+
+def on_mqtt_message(client, userdata, msg):
+    del client, userdata
+    now = time.time()
+    with state.lock:
+        state.mqtt_messages_total += 1
+    try:
+        payload_text = msg.payload.decode("utf-8", errors="replace")
+        payload = json.loads(payload_text)
+        parsed_rows, raw_count = parse_mqtt_payload(payload, msg.topic, now)
+    except Exception as exc:
+        with state.lock:
+            state.mqtt_parse_errors_total += 1
+            state.last_error = str(exc)
+        logger.warning("MQTT parse failure topic=%s: %s", msg.topic, exc)
+        return
+
+    with state.lock:
+        state.rows = parsed_rows
+        state.last_success_ts = now
+        state.last_attempt_ts = now
+        state.last_poll_duration_seconds = 0.0
+        state.last_error = ""
+        state.last_http_status = 0
+        state.source_up = 1
+        state.raw_items_last = raw_count
+        state.exported_items_last = len(parsed_rows)
+        state.mqtt_last_message_ts = now
 
 
 def poll_once() -> None:
@@ -434,6 +577,12 @@ class HwinfoCollector:
             failed_polls = state.failed_polls
             raw_items_last = state.raw_items_last
             exported_items_last = state.exported_items_last
+            source_mode = state.source_mode
+            mqtt_connected = state.mqtt_connected
+            mqtt_last_message_ts = state.mqtt_last_message_ts
+            mqtt_messages_total = state.mqtt_messages_total
+            mqtt_parse_errors_total = state.mqtt_parse_errors_total
+            mqtt_reconnects_total = state.mqtt_reconnects_total
 
         now = time.time()
         age_seconds = (now - last_success_ts) if last_success_ts > 0 else 1e30
@@ -468,6 +617,22 @@ class HwinfoCollector:
         )
         g.add_metric([], DATA_FRESHNESS_TIMEOUT)
         yield g
+        if source_mode == "mqtt":
+            g = GaugeMetricFamily(f"{prefix}_mqtt_connected", "1 if MQTT client is currently connected")
+            g.add_metric([], float(mqtt_connected))
+            yield g
+            g = GaugeMetricFamily(f"{prefix}_mqtt_last_message_timestamp_seconds", "Unix timestamp of last MQTT message")
+            g.add_metric([], mqtt_last_message_ts if mqtt_last_message_ts > 0 else 0.0)
+            yield g
+            g = GaugeMetricFamily(f"{prefix}_mqtt_messages_total", "Total MQTT messages received")
+            g.add_metric([], float(mqtt_messages_total))
+            yield g
+            g = GaugeMetricFamily(f"{prefix}_mqtt_parse_errors_total", "Total MQTT parse errors")
+            g.add_metric([], float(mqtt_parse_errors_total))
+            yield g
+            g = GaugeMetricFamily(f"{prefix}_mqtt_reconnects_total", "Total MQTT reconnects")
+            g.add_metric([], float(mqtt_reconnects_total))
+            yield g
 
         g = GaugeMetricFamily(
             f"{prefix}_exporter_last_success_timestamp_seconds",
@@ -512,7 +677,7 @@ class HwinfoCollector:
 
         # Main stale-data protection at scrape-time:
         # If stale, do not export sensor series at all.
-        if stale == 1:
+        if stale == 1 and STALE_VALUE_MODE == "hide":
             return
 
         label_keys = [
@@ -523,6 +688,7 @@ class HwinfoCollector:
             "sensor_unit",
             "sensor_unit_raw",
             "occurrence",
+            "source",
         ]
 
         value_family = GaugeMetricFamily(
@@ -552,9 +718,10 @@ class HwinfoCollector:
                 row["sensor_unit"],
                 row["sensor_unit_raw"],
                 row["occurrence"],
+                row.get("source", "http"),
             ]
-
-            value_family.add_metric(label_values, row["sensor_value"])
+            row_value = row["sensor_value"] if stale == 0 or STALE_VALUE_MODE == "keep" else math.nan
+            value_family.add_metric(label_values, row_value)
             update_family.add_metric(label_values, row["sensor_update_time"])
             present_family.add_metric(label_values, 1.0)
 
@@ -613,6 +780,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     "raw_items_last": state.raw_items_last,
                     "exported_items_last": state.exported_items_last,
                     "data_freshness_timeout_seconds": DATA_FRESHNESS_TIMEOUT,
+                    "source_mode": SOURCE_MODE,
                 }
 
             status = 200 if payload["exporter_up"] else 503
@@ -654,10 +822,25 @@ def main() -> None:
         REGISTRY.register(HwinfoCollector())
         collector_registered = True
 
-    poll_once()
-
-    poll_thread = threading.Thread(target=polling_loop, daemon=True)
-    poll_thread.start()
+    if SOURCE_MODE == "http":
+        poll_once()
+        poll_thread = threading.Thread(target=polling_loop, daemon=True)
+        poll_thread.start()
+    elif SOURCE_MODE == "mqtt":
+        global mqtt_client
+        mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=MQTT_CLIENT_ID)
+        mqtt_client.on_connect = on_mqtt_connect
+        mqtt_client.on_disconnect = on_mqtt_disconnect
+        mqtt_client.on_message = on_mqtt_message
+        mqtt_client.reconnect_delay_set(MQTT_RECONNECT_MIN_DELAY, MQTT_RECONNECT_MAX_DELAY)
+        if MQTT_USERNAME:
+            mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+        if MQTT_TLS:
+            mqtt_client.tls_set()
+        mqtt_client.connect_async(MQTT_HOST, MQTT_PORT, MQTT_KEEPALIVE)
+        mqtt_client.loop_start()
+    else:
+        raise ValueError(f"Unsupported SOURCE_MODE={SOURCE_MODE}; expected http or mqtt")
 
     server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), RequestHandler)
 
@@ -670,6 +853,9 @@ def main() -> None:
     except Exception as exc:
         logger.exception("HTTP server fatal error: %s", exc)
     finally:
+        if mqtt_client is not None:
+            mqtt_client.loop_stop()
+            mqtt_client.disconnect()
         server.server_close()
 
 

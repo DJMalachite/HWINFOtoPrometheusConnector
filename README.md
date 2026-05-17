@@ -101,7 +101,23 @@ Environment variables:
 | `HTTP_TIMEOUT`           | `2`                      | HTTP timeout (seconds) for source requests |
 | `DOWN_RETRY_INTERVAL`    | `2`                      | Faster retry interval (seconds) while source is down |
 | `REQUEST_RETRIES`        | `1`                      | Number of request retries per poll cycle |
+| `SOURCE_MODE`            | `http`                   | Source mode: `http` (HWiNFO/MyRSM) or `mqtt` (Aquasuite/other JSON publishers) |
 | `DATA_FRESHNESS_TIMEOUT` | `20`                     | Data older than this is considered stale and sensor series are withheld |
+| `STALE_VALUE_MODE`       | `hide`                   | Stale sensor handling: `hide`, `keep`, or `nan` |
+| `MQTT_HOST`              | `127.0.0.1`              | MQTT broker host (used when `SOURCE_MODE=mqtt`) |
+| `MQTT_PORT`              | `1883`                   | MQTT broker port |
+| `MQTT_TOPIC`             | `aquasuite/#`            | MQTT subscribe topic filter |
+| `MQTT_USERNAME`          | (empty)                  | Optional MQTT username |
+| `MQTT_PASSWORD`          | (empty)                  | Optional MQTT password |
+| `MQTT_CLIENT_ID`         | `hardware-exporter-<hostname>-<pid>` | MQTT client identifier |
+| `MQTT_KEEPALIVE`         | `60`                     | MQTT keepalive seconds |
+| `MQTT_QOS`               | `0`                      | MQTT subscribe QoS |
+| `MQTT_TLS`               | `false`                  | Enable TLS for MQTT broker connection |
+| `MQTT_RECONNECT_MIN_DELAY` | `1`                    | Minimum reconnect delay seconds |
+| `MQTT_RECONNECT_MAX_DELAY` | `30`                   | Maximum reconnect delay seconds |
+| `MQTT_STALE_AFTER_SECONDS` | `10`                   | MQTT data freshness timeout |
+| `MQTT_DEFAULT_SENSOR_APP` | `aquasuite`             | Fallback `sensor_app` label for MQTT payloads |
+| `MQTT_DEFAULT_SENSOR_CLASS` | `aquasuite`           | Fallback `sensor_class` label for MQTT payloads |
 | `METRIC_PREFIX`          | `hwinfo`                 | Prefix for all exported metric names |
 | `EXPORTER_HOST`          | system hostname          | `host` label value for sensor metrics |
 | `LOG_LEVEL`              | `INFO`                   | Log level (`DEBUG`, `INFO`, etc.) |
@@ -209,6 +225,64 @@ scrape_configs:
 
 ---
 
+## MQTT Source Mode
+
+Use `SOURCE_MODE=mqtt` when your sensor producer publishes JSON over MQTT (for example aquasuite output topics like `aquasuite/AMPINEL`) and you want to reuse the same sensor metrics and labels as HTTP mode.
+
+Supported MQTT JSON payload shapes include:
+- top-level `Data` arrays (aquasuite format),
+- top-level lists (HWiNFO-style item arrays).
+
+The exporter decodes MQTT payload bytes with UTF-8 replacement, safely parses JSON, converts rows into the same internal cache schema, and exposes the same Prometheus sensor metrics.
+
+### Docker Compose example
+
+```yaml
+services:
+  hardware-exporter:
+    build: .
+    container_name: hardware-exporter
+    restart: unless-stopped
+    ports:
+      - "10445:10445"
+    environment:
+      SOURCE_MODE: "mqtt"
+      MQTT_HOST: "10.204.12.83"
+      MQTT_PORT: "1883"
+      MQTT_TOPIC: "aquasuite/#"
+      MQTT_STALE_AFTER_SECONDS: "10"
+      STALE_VALUE_MODE: "hide"
+      EXPORTER_HOST: "gaming_pc"
+      METRIC_PREFIX: "hardware"
+      LISTEN_HOST: "0.0.0.0"
+      LISTEN_PORT: "10445"
+      LOG_LEVEL: "INFO"
+```
+
+### Prometheus scrape example
+
+```yaml
+scrape_configs:
+  - job_name: 'hardware-exporter-mqtt'
+    static_configs:
+      - targets: ['your-exporter-host:10445']
+```
+
+### Stale value notes
+
+- In MQTT mode, data is stale when no message arrives for longer than `MQTT_STALE_AFTER_SECONDS`.
+- `STALE_VALUE_MODE=hide` (default): hide sensor series while stale.
+- `STALE_VALUE_MODE=keep`: keep last numeric values while exposing `*_exporter_stale=1`.
+- `STALE_VALUE_MODE=nan`: keep label sets but export `NaN` values while stale.
+- MQTT health metrics include:
+  - `<prefix>_mqtt_connected`
+  - `<prefix>_mqtt_last_message_timestamp_seconds`
+  - `<prefix>_mqtt_messages_total`
+  - `<prefix>_mqtt_parse_errors_total`
+  - `<prefix>_mqtt_reconnects_total`
+
+---
+
 ## ⚠️ Notes
 
 * Only **numeric sensor values** are exported
@@ -239,4 +313,3 @@ MIT
 * HWiNFO
 * qdel MyRSM (Remote Sensor Monitor)
 * Prometheus ecosystem
-
