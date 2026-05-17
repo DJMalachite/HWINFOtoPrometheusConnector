@@ -22,6 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+import paho.mqtt.client as mqtt
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from prometheus_client.core import GaugeMetricFamily, REGISTRY
 
@@ -427,11 +428,11 @@ def _expired(now: float, last_success_ts: float) -> bool:
     return (last_success_ts <= 0) or ((now - last_success_ts) > timeout)
 
 
-mqtt_client = None
+mqtt_client: Optional[mqtt.Client] = None
 
 
 def on_mqtt_connect(client, userdata, flags, reason_code, properties=None):
-    del userdata, flags, properties
+    del client, userdata, flags, properties
     with state.lock:
         reconnecting = state.mqtt_seen_connect
         state.mqtt_connected = 1
@@ -440,7 +441,7 @@ def on_mqtt_connect(client, userdata, flags, reason_code, properties=None):
             state.mqtt_reconnects_total += 1
         state.mqtt_seen_connect = True
     logger.info("MQTT connected (reason_code=%s); subscribing topic=%s qos=%s", reason_code, MQTT_TOPIC, MQTT_QOS)
-    client.subscribe(MQTT_TOPIC, qos=MQTT_QOS)
+    mqtt_client.subscribe(MQTT_TOPIC, qos=MQTT_QOS)
 
 
 def on_mqtt_disconnect(client, userdata, reason_code, properties=None):
@@ -832,8 +833,6 @@ def main() -> None:
         poll_thread.start()
     elif SOURCE_MODE == "mqtt":
         global mqtt_client
-        if mqtt is None:
-            raise RuntimeError("SOURCE_MODE=mqtt requires paho-mqtt to be installed")
         mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=MQTT_CLIENT_ID)
         mqtt_client.on_connect = on_mqtt_connect
         mqtt_client.on_disconnect = on_mqtt_disconnect

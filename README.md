@@ -177,7 +177,7 @@ In Portainer, use this image in your stack:
 ```yaml
 services:
   hwinfo-exporter:
-    image: ghcr.io/<owner>/<repo>:latest
+    image: ghcr.io/djmalachite/hwinfotopromethuesconnector:latest
     restart: unless-stopped
     ports:
       - "10445:10445"
@@ -240,7 +240,7 @@ The exporter decodes MQTT payload bytes with UTF-8 replacement, safely parses JS
 ```yaml
 services:
   hardware-exporter:
-    build: .
+    image: ghcr.io/djmalachite/hwinfotopromethuesconnector:latest
     container_name: hardware-exporter
     restart: unless-stopped
     ports:
