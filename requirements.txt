@@ -1,2 +1,3 @@
 requests
 prometheus-client
+paho-mqtt
