@@ -26,6 +26,11 @@ import paho.mqtt.client as mqtt
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from prometheus_client.core import GaugeMetricFamily, REGISTRY
 
+try:
+    import paho.mqtt.client as mqtt
+except Exception:  # pragma: no cover - optional dependency in HTTP mode
+    mqtt = None
+
 # -----------------------------------------------------------------------------
 # Config
 # -----------------------------------------------------------------------------
